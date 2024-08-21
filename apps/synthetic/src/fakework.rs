@@ -1,6 +1,5 @@
 extern crate test;
 
-use std::result::Result;
 use std::sync::Arc;
 
 extern crate mersenne_twister;

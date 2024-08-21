@@ -6,6 +6,7 @@
 #![feature(thread_local)]
 #![feature(new_uninit)]
 #![feature(get_mut_unchecked)]
+#![feature(cfg_target_has_atomic)]
 
 extern crate byteorder;
 

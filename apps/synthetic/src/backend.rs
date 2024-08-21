@@ -1,8 +1,5 @@
-use libc;
-use shenango;
 use shenango::tcp::TcpConnection;
 use shenango::udp::UdpConnection;
-use std;
 
 use std::any::Any;
 use std::io;

@@ -1,5 +1,3 @@
-#![feature(integer_atomics)]
-#![feature(nll)]
 #![feature(test)]
 #[macro_use]
 extern crate clap;
@@ -56,12 +54,15 @@ mod dns;
 use dns::DnsProtocol;
 
 #[derive(Copy, Clone, Debug)]
-enum Distribution {
+pub enum Distribution {
     Zero,
     Constant(u64),
     Exponential(f64),
     Bimodal1(f64),
     Bimodal2(f64),
+    RocksDB,
+    GEV(f64, f64, f64),
+    GPerato(f64, f64, f64),
 }
 impl Distribution {
     fn name(&self) -> &'static str {
@@ -71,6 +72,9 @@ impl Distribution {
             Distribution::Exponential(_) => "exponential",
             Distribution::Bimodal1(_) => "bimodal1",
             Distribution::Bimodal2(_) => "bimodal2",
+            Distribution::RocksDB => "rocksdb",
+            Distribution::GEV(..) => "GEV",
+            Distribution::GPerato(..) => "GPerato",
         }
     }
     fn sample<R: Rng>(&self, rng: &mut R) -> u64 {
@@ -79,18 +83,31 @@ impl Distribution {
             Distribution::Constant(m) => m,
             Distribution::Exponential(m) => Exp::new(1.0 / m).ind_sample(rng) as u64,
             Distribution::Bimodal1(m) => {
-                if rng.gen_weighted_bool(10) {
-                    (m * 5.5) as u64
+                if rng.gen_weighted_bool(2) {
+                    (m * 100.0) as u64
+                } else {
+                    (m * 1.0) as u64
+                }
+            }
+            Distribution::Bimodal2(m) => {
+                if rng.gen_weighted_bool(200) {
+                    (m * 500.0) as u64
                 } else {
                     (m * 0.5) as u64
                 }
             }
-            Distribution::Bimodal2(m) => {
-                if rng.gen_weighted_bool(1000) {
-                    (m * 500.5) as u64
+            Distribution::RocksDB => {
+                if rng.gen_weighted_bool(2) {
+                    (591 * 1000) as u64
                 } else {
-                    (m * 0.5) as u64
+                    (950) as u64
                 }
+            }
+            Distribution::GEV(loc, scale, shape) => {
+                (loc + scale * (rng.gen::<f64>().powf(-shape) - 1.0) / shape) as u64
+            }
+            Distribution::GPerato(loc, scale, shape) => {
+                (loc + scale * (Exp::new(1.0).ind_sample(rng).powf(-shape) - 1.0) / shape) as u64
             }
         }
     }
@@ -305,7 +322,6 @@ fn gen_classic_packet_schedule(
     nthreads: usize,
 ) -> Vec<RequestSchedule> {
     let mut sched: Vec<RequestSchedule> = Vec::new();
-
     /* Ramp up in 100ms increments */
     for t in 1..(10 * ramp_up_seconds) {
         let rate = t * packets_per_second / (ramp_up_seconds * 10);
@@ -327,7 +343,15 @@ fn gen_classic_packet_schedule(
         runtime: runtime,
         discard_pct: 10,
     });
+    // println!("{} {} {}", ramp_up_seconds, sched.len(), ns_per_packet);
 
+    // sched.push(RequestSchedule {
+    //     arrival: Distribution::GPerato(0.0, 16029.2, 0.154971),
+    //     service: distribution,
+    //     output: output,
+    //     runtime: runtime,
+    //     discard_pct: 10,
+    // });
     sched
 }
 
@@ -353,7 +377,7 @@ fn gen_loadshift_experiment(
         .collect()
 }
 
-fn process_result(sched: &RequestSchedule, packets: &mut [Packet], wct_start: SystemTime) -> bool {
+fn process_result(sched: &RequestSchedule, packets: &mut [Packet], wct_start: SystemTime, slowdown: bool) -> bool {
     let start_unix = wct_start + packets[0].target_start;
 
     // Discard the first X% of the packets.
@@ -366,7 +390,7 @@ fn process_result(sched: &RequestSchedule, packets: &mut [Packet], wct_start: Sy
         .filter(|p| p.completion_time.is_none())
         .count()
         - never_sent;
-
+    // println!("{} {} {}", plen, packets.len(), never_sent);
     if packets.len() - dropped - never_sent <= 1 {
         match sched.output {
             OutputMode::Silent => {}
@@ -396,18 +420,25 @@ fn process_result(sched: &RequestSchedule, packets: &mut [Packet], wct_start: Sy
     let mut latencies: Vec<_> = packets
         .iter()
         .filter_map(|p| match (p.actual_start, p.completion_time) {
-            (Some(ref start), Some(ref end)) => Some(*end - *start),
+            (Some(ref start), Some(ref end)) => {
+                let ns = duration_to_ns(*end - *start) as f32;
+                if slowdown {
+                    Some(ns / p.work_iterations as f32)
+                } else {
+                    Some(ns / 1000.0)
+                }
+            }
             _ => None,
         })
         .collect();
-    latencies.sort();
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let percentile = |p| {
         let idx = ((packets.len() - never_sent) as f32 * p / 100.0) as usize;
         if idx >= latencies.len() {
             return INFINITY;
         }
-        duration_to_ns(latencies[idx]) as f32 / 1000.0
+        latencies[idx]
     };
 
     println!(
@@ -431,37 +462,38 @@ fn process_result(sched: &RequestSchedule, packets: &mut [Packet], wct_start: Sy
         for p in packets {
             if let Some(completion_time) = p.completion_time {
                 let actual_start = p.actual_start.unwrap();
-                print!(
-                    "{}:{}:{} ",
+                println!(
+                    "{}:{}:{}",
                     duration_to_ns(actual_start),
                     duration_to_ns(actual_start) as i64 - duration_to_ns(p.target_start) as i64,
                     duration_to_ns(completion_time - actual_start)
                 )
             } else if p.actual_start.is_some() {
                 let actual_start = p.actual_start.unwrap();
-                print!(
-                    "{}:{}:-1 ",
+                println!(
+                    "{}:{}:-1",
                     duration_to_ns(actual_start),
                     duration_to_ns(actual_start) as i64 - duration_to_ns(p.target_start) as i64,
                 )
             } else {
-                print!("{}:-1:-1 ", duration_to_ns(p.target_start))
+                println!("{}:-1:-1", duration_to_ns(p.target_start))
             }
         }
         println!("");
     }
 
     if let OutputMode::Buckets = sched.output {
-        let mut buckets = BTreeMap::new();
+        unimplemented!()
+        // let mut buckets = BTreeMap::new();
 
-        for l in latencies {
-            *buckets.entry(duration_to_ns(l) / 1000).or_insert(0) += 1;
-        }
-        print!("Latencies: ");
-        for k in buckets.keys() {
-            print!("{}:{} ", k, buckets[k]);
-        }
-        println!("");
+        // for l in latencies {
+        //     *buckets.entry(l).or_insert(0) += 1;
+        // }
+        // print!("Latencies: ");
+        // for k in buckets.keys() {
+        //     print!("{}:{} ", k, buckets[k]);
+        // }
+        // println!("");
     }
     true
 }
@@ -475,6 +507,7 @@ fn run_client(
     barrier_group: &mut Option<lockstep::Group>,
     schedules: &Vec<RequestSchedule>,
     index: usize,
+    slowdown: bool,
 ) -> bool {
     let mut rng = rand::thread_rng();
 
@@ -559,15 +592,23 @@ fn run_client(
                 protocol.gen_request(i, packet, &mut payload, tport);
 
                 let mut t = start.elapsed();
-                while t + Duration::from_micros(1) < packet.target_start {
-                    backend.sleep(packet.target_start - t);
+                // while t + Duration::from_micros(1) < packet.target_start {
+                // //     // println!("  sleep {} {:?}", i, packet.target_start - t);
+                //     backend.sleep(packet.target_start - t);
+                //     t = start.elapsed();
+                // }
+
+                while t < packet.target_start {
+                    backend.thread_yield();
                     t = start.elapsed();
                 }
                 if t > packet.target_start + Duration::from_micros(5) {
+                    // println!("send timeout {} {:?}", i, t - packet.target_start);
                     continue;
                 }
 
                 packet.actual_start = Some(start.elapsed());
+                // println!("send,{},{},{:?},{:?}", i, len, packet.target_start.as_nanos(), packet.actual_start.unwrap().as_nanos());
                 if let Err(e) = (&*socket2).write_all(&payload[..]) {
                     packet.actual_start = None;
                     match e.raw_os_error() {
@@ -610,7 +651,7 @@ fn run_client(
             .position(|p| p.target_start >= start + sched.runtime)
             .unwrap_or(packets.len());
         let rest = packets.split_off(last_index);
-        let res = process_result(&sched, packets.as_mut_slice(), start_unix);
+        let res = process_result(&sched, packets.as_mut_slice(), start_unix, slowdown);
         packets = rest;
         start += sched.runtime;
         res
@@ -711,7 +752,7 @@ fn run_local(
             .position(|p| p.target_start >= start + sched.runtime)
             .unwrap_or(packets.len());
         let rest = packets.split_off(last_index);
-        let res = process_result(&sched, packets.as_mut_slice(), start_unix);
+        let res = process_result(&sched, packets.as_mut_slice(), start_unix, false);
         packets = rest;
         start += sched.runtime;
         res
@@ -750,6 +791,13 @@ fn main() {
                 .required(true)
                 .requires_ifs(&[("runtime-client", "config"), ("spawner-server", "config")])
                 .help("Which mode to run in"),
+        )
+        .arg(
+            Arg::with_name("slowdown")
+            .short("s")
+            .long("slowdown")
+            .takes_value(false)
+            .help("Use slowdown instead of latency to represent results"),
         )
         .arg(
             Arg::with_name("runtime")
@@ -808,7 +856,14 @@ fn main() {
                 .long("distribution")
                 .short("d")
                 .takes_value(true)
-                .possible_values(&["zero", "constant", "exponential", "bimodal1", "bimodal2"])
+                .possible_values(&[
+                    "zero",
+                    "constant",
+                    "exponential",
+                    "bimodal1",
+                    "bimodal2",
+                    "rocksdb",
+                ])
                 .default_value("zero")
                 .help("Distribution of request lengths to use"),
         )
@@ -872,7 +927,7 @@ fn main() {
 
     let addr: SocketAddrV4 = FromStr::from_str(matches.value_of("ADDR").unwrap()).unwrap();
     let nthreads = value_t_or_exit!(matches, "threads", usize);
-    let runtime = Duration::from_secs(value_t!(matches, "runtime", u64).unwrap());
+    let runtime = Duration::from_nanos(value_t!(matches, "runtime",u64).unwrap());
     let packets_per_second = (1.0e6 * value_t_or_exit!(matches, "mpps", f32)) as usize;
     let start_packets_per_second = (1.0e6 * value_t_or_exit!(matches, "start_mpps", f32)) as usize;
     assert!(start_packets_per_second <= packets_per_second);
@@ -888,11 +943,13 @@ fn main() {
         "exponential" => Distribution::Exponential(mean),
         "bimodal1" => Distribution::Bimodal1(mean),
         "bimodal2" => Distribution::Bimodal2(mean),
+        "rocksdb" => Distribution::RocksDB,
         _ => unreachable!(),
     };
     let samples = value_t_or_exit!(matches, "samples", usize);
     let rampup = value_t_or_exit!(matches, "rampup", usize);
     let mode = matches.value_of("mode").unwrap();
+    let slowdown = matches.is_present("slowdown");
     let backend = match mode {
         "linux-server" | "linux-client" => Backend::Linux,
         "spawner-server" | "runtime-client" | "work-bench" | "local-client" => Backend::Runtime,
@@ -906,6 +963,7 @@ fn main() {
         )
         .unwrap()
     });
+    println!("Slowdown: {}", slowdown);
 
     let loadshift_spec = value_t_or_exit!(matches, "loadshift", String);
     let fakeworker = FakeWorker::create(matches.value_of("fakework").unwrap()).unwrap();
@@ -1000,6 +1058,7 @@ fn main() {
                         &mut barrier_group,
                         &sched,
                         0,
+                        slowdown,
                     );
                     return;
                 }
@@ -1025,11 +1084,12 @@ fn main() {
                             &mut barrier_group,
                             &sched,
                             0,
+                            slowdown,
                         );
                         backend.sleep(Duration::from_secs(5));
                     }
                 }
-
+                println!("finish warmup");
                 let step_size = (packets_per_second - start_packets_per_second) / samples;
                 for j in 1..=samples {
                     backend.sleep(Duration::from_secs(5));
@@ -1050,11 +1110,21 @@ fn main() {
                         &mut barrier_group,
                         &sched,
                         j,
+                        slowdown,
                     );
                 }
                 if let Some(ref mut g) = barrier_group {
                     g.barrier();
                 }
+
+                let mut stat_sock = backend.create_udp_connection("0.0.0.0:0".parse().unwrap(), Some(SocketAddrV4::new(*addr.ip(), 40))).unwrap();
+                stat_sock.write_all(b"stat\n");
+
+                use std::io::Read;
+                let mut buf = [0u8; 1024];
+                let mut response = String::new();
+                stat_sock.read(&mut buf);
+                println!("{}", core::str::from_utf8(&buf).unwrap());
             });
         }
         _ => unreachable!(),

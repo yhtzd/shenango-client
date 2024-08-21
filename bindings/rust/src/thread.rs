@@ -1,7 +1,5 @@
 use std::any::Any;
-use std::cell::UnsafeCell;
-use std::os::raw::c_void;
-use std::{mem, panic, ptr};
+use std::{panic, ptr};
 
 use super::*;
 
